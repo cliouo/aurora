@@ -16,6 +16,7 @@ targets=(
     "darwin/386"
     "linux/arm"
     "linux/arm64"
+    "linux/s390x"    
 )
 
 upxPath=$(command -v upx)
@@ -23,10 +24,18 @@ upxPath=$(command -v upx)
 for target in "${targets[@]}"; do
     GOOS=${target%/*}
     GOARCH=${target#*/}
-    output="bin/${GOOS}_${GOARCH}/${PKG}"
-    mkdir -p $(dirname ${output})
-    GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -extldflags '-static'" -o ${output} *.go
+    outputDir="bin/${GOOS}_${GOARCH}"
+    outputFile="${outputDir}/${PKG}"
+    archiveName="${PKG}-${GOOS}-${GOARCH}.tar.gz"
+    mkdir -p $(dirname ${outputFile})
+    GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w -extldflags '-static'" -o ${outputFile} *.go
     if [ -n "$upxPath" ]; then
-        $upxPath -9 ${output}
+        $upxPath -9 ${outputFile}
+    fi
+    # Archive the binary
+    if [ "$GOOS" = "windows" ]; then
+        zip -j "${outputDir}/${PKG}-${GOOS}-${GOARCH}.zip" "${outputFile}"
+    else
+        tar -C "${outputDir}" -czf "${outputDir}/${archiveName}" "${PKG}"
     fi
 done

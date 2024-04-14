@@ -12,7 +12,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"net/http"
 
 	//http "github.com/bogdanfinn/fhttp"
@@ -30,7 +30,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-var HostURL string
 var BaseURL string
 
 func init() {
@@ -38,9 +37,6 @@ func init() {
 	BaseURL = os.Getenv("BASE_URL")
 	if BaseURL == "" {
 		BaseURL = "https://chat.openai.com/backend-anon"
-	}
-	if HostURL == "" {
-		HostURL = "https://chat.openai.com/backend-anon"
 	}
 }
 
@@ -62,7 +58,7 @@ var (
 )
 
 func getWSURL(client httpclient.AuroraHttpClient, token string, retry int) (string, error) {
-	requestURL := HostURL + "/register-websocket"
+	requestURL := BaseURL + "/register-websocket"
 	header := make(httpclient.AuroraHeaders)
 	header.Set("User-Agent", userAgent)
 	header.Set("Accept", "*/*")
@@ -218,26 +214,22 @@ type TurnStile struct {
 	ExpireAt       time.Time
 }
 
-func InitTurnStile(client httpclient.AuroraHttpClient, secret *tokens.Secret, proxy string, retry int) (*TurnStile, int, error) {
+func InitTurnStile(client httpclient.AuroraHttpClient, secret *tokens.Secret, proxy string) (*TurnStile, int, error) {
 	poolMutex.Lock()
 	defer poolMutex.Unlock()
 	currTurnToken := TurnStilePool[secret.Token]
 	if currTurnToken == nil || currTurnToken.ExpireAt.Before(time.Now()) {
 		response, err := POSTTurnStile(client, secret, proxy, 0)
 		if err != nil {
-			return nil, response.StatusCode, err
+			return nil, http.StatusInternalServerError, err
 		}
 		defer response.Body.Close()
-		if response.StatusCode != 200 && retry > 0 {
-			return InitTurnStile(client, secret, proxy, retry-1)
+		if response.StatusCode != 200 {
+			return nil, response.StatusCode, fmt.Errorf("failed to get chat requirements")
 		}
 		var result chatgpt_types.RequirementsResponse
-		if err := json.NewDecoder(response.Body).Decode(&result); err != nil && retry > 0 {
-			return InitTurnStile(client, secret, proxy, retry-1)
-		}
-		//  retry stop
-		if retry <= 0 {
-			return nil, response.StatusCode, errors.New("retry limit exceeded")
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			return nil, response.StatusCode, err
 		}
 		currTurnToken = &TurnStile{
 			TurnStileToken: result.Token,
@@ -254,7 +246,6 @@ func POSTTurnStile(client httpclient.AuroraHttpClient, secret *tokens.Secret, pr
 	}
 	apiUrl := BaseURL + "/sentinel/chat-requirements"
 	payload := strings.NewReader(`{"conversation_mode_kind":"primary_assistant"}`)
-
 	header := make(httpclient.AuroraHeaders)
 	header.Set("Content-Type", "application/json")
 	header.Set("User-Agent", userAgent)
@@ -274,7 +265,7 @@ func POSTTurnStile(client httpclient.AuroraHttpClient, secret *tokens.Secret, pr
 	}
 	if response.StatusCode == 401 && secret.IsFree {
 		if retry > 3 {
-			return &http.Response{}, err
+			return response, err
 		}
 		time.Sleep(time.Second * 2)
 		secret.Token = uuid.NewString()
@@ -291,7 +282,7 @@ type urlAttr struct {
 }
 
 func getURLAttribution(client httpclient.AuroraHttpClient, access_token string, puid string, url string) string {
-	requestURL := HostURL + "/attributions"
+	requestURL := BaseURL + "/attributions"
 	payload := bytes.NewBuffer([]byte(`{"urls":["` + url + `"]}`))
 	header := make(httpclient.AuroraHeaders)
 	if puid != "" {
@@ -318,11 +309,11 @@ func getURLAttribution(client httpclient.AuroraHttpClient, access_token string, 
 	return attr.Attribution
 }
 
-func POSTconversation(client httpclient.AuroraHttpClient, message chatgpt_types.ChatGPTRequest, secret *tokens.Secret, chat_token *TurnStile, proxy string, retry int) (*http.Response, error) {
+func POSTconversation(client httpclient.AuroraHttpClient, message chatgpt_types.ChatGPTRequest, secret *tokens.Secret, chat_token *TurnStile, proxy string) (*http.Response, error) {
 	if proxy != "" {
 		client.SetProxy(proxy)
 	}
-	apiUrl := HostURL + "/conversation"
+	apiUrl := BaseURL + "/conversation"
 	if API_REVERSE_PROXY != "" {
 		apiUrl = API_REVERSE_PROXY
 	}
@@ -358,14 +349,10 @@ func POSTconversation(client httpclient.AuroraHttpClient, message chatgpt_types.
 		header.Set("oai-device-id", secret.Token)
 	}
 	response, err := client.Request(http.MethodPost, apiUrl, header, nil, bytes.NewBuffer(body_json))
-	if err != nil && retry > 0 {
-		return POSTconversation(client, message, secret, chat_token, proxy, retry-1)
+	if err != nil {
+		return nil, err
 	}
-	//  retry stop
-	if retry <= 0 {
-		return nil, errors.New("retry limit exceeded")
-	}
-	return response, err
+	return response, nil
 }
 
 type EnginesData struct {
@@ -394,7 +381,7 @@ func GETengines(client httpclient.AuroraHttpClient, secret *tokens.Secret, proxy
 	if proxy != "" {
 		client.SetProxy(proxy)
 	}
-	reqUrl := HostURL + "/models"
+	reqUrl := BaseURL + "/models"
 	header := make(httpclient.AuroraHeaders)
 	header.Set("Content-Type", "application/json")
 	header.Set("User-Agent", userAgent)
@@ -431,7 +418,7 @@ func Handle_request_error(c *gin.Context, response *http.Response) bool {
 		if err != nil {
 			// Read response body
 			body, _ := io.ReadAll(response.Body)
-			c.JSON(500, gin.H{"error": gin.H{
+			c.JSON(response.StatusCode, gin.H{"error": gin.H{
 				"message": "Unknown error",
 				"type":    "internal_server_error",
 				"param":   nil,
@@ -645,8 +632,8 @@ func Handler(c *gin.Context, response *http.Response, client httpclient.AuroraHt
 					attr := urlAttrMap[citation.Metadata.URL]
 					if attr == "" {
 						u, _ := url.Parse(citation.Metadata.URL)
-						HostURL := u.Scheme + "://" + u.Host + "/"
-						attr = getURLAttribution(client, secret.Token, secret.PUID, HostURL)
+						BaseURL := u.Scheme + "://" + u.Host + "/"
+						attr = getURLAttribution(client, secret.Token, secret.PUID, BaseURL)
 						if attr != "" {
 							urlAttrMap[citation.Metadata.URL] = attr
 						}
@@ -663,7 +650,7 @@ func Handler(c *gin.Context, response *http.Response, client httpclient.AuroraHt
 				continue
 			}
 			if original_response.Message.Content.ContentType == "multimodal_text" {
-				apiUrl := HostURL + "/files/"
+				apiUrl := BaseURL + "/files/"
 				if FILES_REVERSE_PROXY != "" {
 					apiUrl = FILES_REVERSE_PROXY
 				}
